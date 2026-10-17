@@ -1,0 +1,26 @@
+# Python 編譯暫存
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+
+# 深度學習權重與大檔案（絕對不能進 Git）
+*.pth
+*.pt
+*.bin
+*.safetensors
+checkpoints/
+data/
+outputs/
+logs/
+wandb/
+
+# 編輯器暫存
+.vscode/
+.idea/
+.DS_Store
+
+# Pipenv 環境檔
+.venv/
+Pipfile.lock

@@ -1,0 +1,20 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "*"
+torchvision = "*"
+transformers = ">=4.45.0"
+peft = ">=0.12.0"
+accelerate = ">=0.30.0"
+datasets = "*"
+pillow = "*"
+tqdm = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
+python_full_version = "3.10.2"
