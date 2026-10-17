@@ -12,6 +12,7 @@ accelerate = ">=0.30.0"
 datasets = "*"
 pillow = "*"
 tqdm = "*"
+huggingface-hub = "*"
 
 [dev-packages]
 
