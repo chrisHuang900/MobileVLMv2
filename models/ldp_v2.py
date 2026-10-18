@@ -8,7 +8,7 @@ class LDPv2Projector(nn.Module):
     將 SigLIP 輸出的 (B, 256, 1152) 降採樣壓縮成 (B, 64, 2048)
     Token 數量減少 75%，大幅降低語言模型的注意力計算負擔
     """
-    def __init__(self, in_dim=1152, out_dim=2048):
+    def __init__(self, in_dim=1152, out_dim=2304):  # 將 2048 改為 2304
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
