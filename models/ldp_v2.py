@@ -1,64 +1,80 @@
+import math
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
+
 
 class LDPv2Projector(nn.Module):
     """
-    LDP-v2 (Lightweight Downsample Projector v2)
-    將 SigLIP 輸出的 (B, 256, 1152) 降採樣壓縮成 (B, 64, 2048)
-    Token 數量減少 75%，大幅降低語言模型的注意力計算負擔
+    自適應多解析度 LDP-v2 輕量化投影層：
+    - 支援 224x224 (256 tokens -> 64 tokens)
+    - 支援 448x448 (1024 tokens -> 256 tokens)
+    將 SigLIP 影像特徵進行空間 2x2 (4倍) 降採樣，並映射至 LLM 隱藏維度。
     """
-    def __init__(self, in_dim=1152, out_dim=2304):  # 將 2048 改為 2304
+    def __init__(self, in_dim=1152, out_dim=3584):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        
-        # 1. 主分支：Depthwise Separable Convolution (長寬減半: 16x16 -> 8x8)
+
+        # 卷積主幹分支 (深度可分離卷積，stride=2 進行空間降採樣)
         self.conv_branch = nn.Sequential(
-            nn.Conv2d(in_dim, in_dim, kernel_size=1),              # 跨通道特徵融合
+            nn.Conv2d(in_dim, in_dim, kernel_size=3, stride=2, padding=1, groups=in_dim, bias=False),
+            nn.BatchNorm2d(in_dim),
             nn.GELU(),
-            nn.Conv2d(in_dim, in_dim, kernel_size=3, stride=2, padding=1, groups=in_dim), # 深度卷積 (空間降採樣)
-            nn.GELU(),
-            nn.Conv2d(in_dim, out_dim, kernel_size=1),             # 投影至語言模型維度
-            nn.GELU()
+            nn.Conv2d(in_dim, out_dim, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_dim),
         )
-        
-        # 2. 殘差分支：Adaptive Avg Pooling (固定下採樣為 8x8) + 1x1 投影
-        self.pool_branch = nn.Sequential(
-            nn.AdaptiveAvgPool2d((8, 8)),
-            nn.Conv2d(in_dim, out_dim, kernel_size=1),
-            nn.GELU()
+
+        # 池化殘差分支 (1x1 卷積變換維度)
+        self.pool_proj = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_dim),
         )
-        
-        # 3. 輸出層 LayerNorm
-        self.norm = nn.LayerNorm(out_dim)
+
+        self.act = nn.GELU()
 
     def forward(self, x):
-        # x 輸入形狀: (Batch, Tokens, Dim) = (B, 256, 1152)
+        # x 形狀: (B, N, C)，例如 (B, 1024, 1152) 或 (B, 256, 1152)
         B, N, C = x.shape
-        H = W = int(math.sqrt(N))  # 16 x 16
-        
-        # 轉成 2D 空間特徵圖: (B, Dim, H, W)
-        x_2d = x.transpose(1, 2).view(B, C, H, W)
-        
-        # 雙流並行計算
-        out_conv = self.conv_branch(x_2d)  # (B, out_dim, 8, 8)
-        out_pool = self.pool_branch(x_2d)  # (B, out_dim, 8, 8)
-        
-        # 雙流相加融合
-        out_2d = out_conv + out_pool       # (B, out_dim, 8, 8)
-        
-        # 展平回序列特徵: (B, 64, out_dim)
+        H = W = int(math.isqrt(N))
+        assert H * W == N, f"輸入 token 數 {N} 無法開整數根號還原為 2D 特徵圖！"
+
+        # 轉置為 2D 空間特徵: (B, C, H, W)
+        x_2d = x.transpose(1, 2).reshape(B, C, H, W)
+
+        # 卷積降採樣 (H, W 變為 H//2, W//2)
+        out_conv = self.conv_branch(x_2d)
+        target_h, target_w = out_conv.shape[2], out_conv.shape[3]
+
+        # 自適應池化分支：尺寸動態對齊卷積輸出
+        out_pool = F.adaptive_avg_pool2d(x_2d, (target_h, target_w))
+        out_pool = self.pool_proj(out_pool)
+
+        # 融合兩路特徵並通過激活函數
+        out_2d = self.act(out_conv + out_pool)
+
+        # 展平回序列形式: (B, target_N, out_dim)
         out = out_2d.flatten(2).transpose(1, 2)
-        out = self.norm(out)
         return out
 
+
 if __name__ == "__main__":
-    # 單元測試：確認維度轉換
-    test_input = torch.randn(2, 256, 1152)
-    projector = LDPv2Projector(1152, 2048)
-    test_output = projector(test_input)
-    print(f"輸入特徵形狀: {test_input.shape}")
-    print(f"LDP-v2 降採樣後特徵形狀: {test_output.shape}")
-    assert test_output.shape == (2, 64, 2048), "維度轉換錯誤！"
-    print("✅ LDP-v2 單元測試通過！")
+    # 單元測試 1: 448x448 解析度 (1024 tokens -> 256 tokens)
+    print("--- 測試 448 解析度 (10B 規格) ---")
+    x_448 = torch.randn(2, 1024, 1152)
+    proj_10b = LDPv2Projector(in_dim=1152, out_dim=3584)
+    out_448 = proj_10b(x_448)
+    print(f"輸入特徵形狀: {x_448.shape}")
+    print(f"LDP-v2 輸出形狀: {out_448.shape}")
+    assert out_448.shape == (2, 256, 3584), "448 規格維度計算錯誤！"
+    print("✅ 448 規格測試通過！\n")
+
+    # 單元測試 2: 224x224 解析度 (256 tokens -> 64 tokens)
+    print("--- 測試 224 解析度 (3B 規格) ---")
+    x_224 = torch.randn(2, 256, 1152)
+    proj_3b = LDPv2Projector(in_dim=1152, out_dim=2304)
+    out_224 = proj_3b(x_224)
+    print(f"輸入特徵形狀: {x_224.shape}")
+    print(f"LDP-v2 輸出形狀: {out_224.shape}")
+    assert out_224.shape == (2, 64, 2304), "224 規格維度計算錯誤！"
+    print("✅ 224 規格測試通過！")
