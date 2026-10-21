@@ -14,7 +14,7 @@ from models.ldp_v2 import LDPv2Projector
 
 class PaliGemmaLDPv2ForConditionalGeneration(nn.Module):
     """
-    包裝 PaliGemma 2-10B，以直接特徵拼接取代原廠 masked_scatter，
+    包裝 PaliGemma 2-3B (224x224)，以直接特徵拼接取代原廠 masked_scatter，
     並內建 LM Head 投影與 CrossEntropyLoss 計算。
     """
     def __init__(self, base_model):
@@ -36,20 +36,20 @@ class PaliGemmaLDPv2ForConditionalGeneration(nn.Module):
     def forward(self, input_ids=None, attention_mask=None, pixel_values=None, labels=None, **kwargs):
         core = self.base_model.model if hasattr(self.base_model, "model") else self.base_model
 
-        # 1. 取得文字 Embedding (10B 隱藏層維度: 3584)
+        # 1. 取得文字 Embedding (3B 隱藏層維度: 2048)
         embed_tokens = core.language_model.get_input_embeddings()
         text_embeds = embed_tokens(input_ids)
 
         # 2. 取得影像特徵並通過 LDP-v2 (4倍降採樣)
         if pixel_values is not None:
-            # 448x448 下 SigLIP 特徵: (B, 1024, 1152)
+            # 224x224 下 SigLIP 特徵: (B, 256, 1152)
             image_outputs = core.vision_tower(pixel_values)
             selected_image_feature = image_outputs.last_hidden_state
 
-            # LDP-v2 降採樣: (B, 256, 3584)
+            # LDP-v2 降採樣: (B, 64, 2048)
             image_features = core.multi_modal_projector(selected_image_feature)
 
-            # 3. 拼接影像與文字特徵: (B, 256 + Text_Len, 3584)
+            # 3. 拼接影像與文字特徵: (B, 64 + Text_Len, 2048)
             inputs_embeds = torch.cat([image_features, text_embeds], dim=1)
 
             # 4. 同步擴展 attention_mask
@@ -109,7 +109,7 @@ class PaliGemmaLDPv2ForConditionalGeneration(nn.Module):
         )
 
 
-def build_paligemma_ldpv2(model_id="google/paligemma2-10b-pt-448", use_lora=True, device="cuda:0"):
+def build_paligemma_ldpv2(model_id="google/paligemma2-3b-pt-224", use_lora=True, device="cuda:0"):
     print(f"正在載入基底模型: {model_id} ...")
     raw_model = PaliGemmaForConditionalGeneration.from_pretrained(
         model_id,
@@ -124,11 +124,11 @@ def build_paligemma_ldpv2(model_id="google/paligemma2-10b-pt-448", use_lora=True
     core.vision_tower.requires_grad_(False)
     print("已成功凍結視覺編碼器 (SigLIP)。")
 
-    # 2. 自動偵測語言模型隱藏層維度 (10B 為 3584)
+    # 2. 自動偵測語言模型隱藏層維度 (3B 為 2048)
     llm_hidden_size = core.language_model.config.hidden_size
     print(f"偵測到語言模型隱藏層維度: {llm_hidden_size}")
 
-    # 3. 換裝 LDP-v2 Projector (1152 -> 3584，可訓練)
+    # 3. 換裝 LDP-v2 Projector (1152 -> 2048，可訓練)
     core.multi_modal_projector = LDPv2Projector(in_dim=1152, out_dim=llm_hidden_size).to(
         dtype=torch.bfloat16, device=device
     )
@@ -137,6 +137,10 @@ def build_paligemma_ldpv2(model_id="google/paligemma2-10b-pt-448", use_lora=True
 
     # 4. 語言模型掛載 LoRA
     if use_lora:
+        # 配合 gradient checkpointing 確保輸入張量能接收梯度
+        if hasattr(core.language_model, "enable_input_require_grads"):
+            core.language_model.enable_input_require_grads()
+
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
@@ -146,7 +150,7 @@ def build_paligemma_ldpv2(model_id="google/paligemma2-10b-pt-448", use_lora=True
             task_type=None  # 避免觸發 CAUSAL_LM 的 prepare_inputs_for_generation 檢查
         )
         core.language_model = get_peft_model(core.language_model, lora_config)
-        print("已成功在語言模型 (Gemma 2-9B) 上掛載 LoRA。")
+        print("已成功在語言模型 (Gemma 2-2B) 上掛載 LoRA。")
 
     # 5. 包裝模型
     model = PaliGemmaLDPv2ForConditionalGeneration(raw_model)
@@ -161,4 +165,4 @@ if __name__ == "__main__":
     total = sum(p.numel() for p in model.parameters())
     print(f"總參數量: {total / 1e9:.2f} B")
     print(f"可訓練參數量: {trainable / 1e6:.2f} M ({trainable / total * 100:.2f}%)")
-    print("✅ 模型組裝測試完成！")
+    print("模型組裝測試完成！")

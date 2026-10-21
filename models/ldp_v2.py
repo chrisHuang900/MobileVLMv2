@@ -9,9 +9,9 @@ class LDPv2Projector(nn.Module):
     自適應多解析度 LDP-v2 輕量化投影層：
     - 支援 224x224 (256 tokens -> 64 tokens)
     - 支援 448x448 (1024 tokens -> 256 tokens)
-    將 SigLIP 影像特徵進行空間 2x2 (4倍) 降採樣，並映射至 LLM 隱藏維度。
+    將 SigLIP 影像特徵進行空間 2x2 (4倍) 降採樣，並映射至 3B LLM 隱藏維度 (預設 2048)。
     """
-    def __init__(self, in_dim=1152, out_dim=3584):
+    def __init__(self, in_dim=1152, out_dim=2048):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -34,7 +34,7 @@ class LDPv2Projector(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x):
-        # x 形狀: (B, N, C)，例如 (B, 1024, 1152) 或 (B, 256, 1152)
+        # x 形狀: (B, N, C)，例如 224 解析度下為 (B, 256, 1152)
         B, N, C = x.shape
         H = W = int(math.isqrt(N))
         assert H * W == N, f"輸入 token 數 {N} 無法開整數根號還原為 2D 特徵圖！"
@@ -53,28 +53,18 @@ class LDPv2Projector(nn.Module):
         # 融合兩路特徵並通過激活函數
         out_2d = self.act(out_conv + out_pool)
 
-        # 展平回序列形式: (B, target_N, out_dim)
+        # 展平回序列形式: (B, target_N, out_dim) -> (B, 64, 2048)
         out = out_2d.flatten(2).transpose(1, 2)
         return out
 
 
 if __name__ == "__main__":
-    # 單元測試 1: 448x448 解析度 (1024 tokens -> 256 tokens)
-    print("--- 測試 448 解析度 (10B 規格) ---")
-    x_448 = torch.randn(2, 1024, 1152)
-    proj_10b = LDPv2Projector(in_dim=1152, out_dim=3584)
-    out_448 = proj_10b(x_448)
-    print(f"輸入特徵形狀: {x_448.shape}")
-    print(f"LDP-v2 輸出形狀: {out_448.shape}")
-    assert out_448.shape == (2, 256, 3584), "448 規格維度計算錯誤！"
-    print("✅ 448 規格測試通過！\n")
-
-    # 單元測試 2: 224x224 解析度 (256 tokens -> 64 tokens)
+    # 單元測試: 224x224 解析度 (256 tokens -> 64 tokens，對應 3B 規格)
     print("--- 測試 224 解析度 (3B 規格) ---")
     x_224 = torch.randn(2, 256, 1152)
-    proj_3b = LDPv2Projector(in_dim=1152, out_dim=2304)
+    proj_3b = LDPv2Projector(in_dim=1152, out_dim=2048)
     out_224 = proj_3b(x_224)
     print(f"輸入特徵形狀: {x_224.shape}")
     print(f"LDP-v2 輸出形狀: {out_224.shape}")
-    assert out_224.shape == (2, 64, 2304), "224 規格維度計算錯誤！"
-    print("✅ 224 規格測試通過！")
+    assert out_224.shape == (2, 64, 2048), "224 規格 3B 維度計算錯誤！"
+    print("224 規格 3B 測試通過！")

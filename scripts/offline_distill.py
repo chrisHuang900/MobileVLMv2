@@ -2,93 +2,163 @@ import os
 import sys
 from pathlib import Path
 
+# 將專案根目錄加入模組路徑
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import json
 import torch
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
 from transformers import PaliGemmaForConditionalGeneration, AutoProcessor
 
 
-def setup_teacher_model(model_id="google/paligemma2-10b-pt-448", device="cuda:0"):
-    print(f"正在載入教師模型: {model_id} ...")
+class LLaVAInstructDataset(Dataset):
+    """
+    讀取 llava_instruct_150k.json 並過濾已提取過或不存在的圖片
+    """
+    def __init__(self, json_path, image_root, output_feat_dir, max_samples=3000):
+        print(f"正在載入標註檔: {json_path} ...")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.samples = []
+        for item in data:
+            if "image" not in item:
+                continue
+
+            sample_id = str(item.get("id", len(self.samples)))
+            target_feat_path = os.path.join(output_feat_dir, f"{sample_id}.pt")
+
+            # 斷點續傳支援：若已提取過則直接跳過，節省時間
+            if os.path.exists(target_feat_path):
+                continue
+
+            img_filename = os.path.basename(item["image"])
+            img_path = os.path.join(image_root, img_filename)
+
+            if not os.path.exists(img_path):
+                continue
+
+            convs = item.get("conversations", [])
+            if len(convs) < 2:
+                continue
+
+            instruction = convs[0]["value"].replace("<image>\n", "").replace("<image>", "").strip()
+            response = convs[1]["value"].strip()
+
+            self.samples.append({
+                "id": sample_id,
+                "image_path": img_path,
+                "instruction": instruction,
+                "response": response
+            })
+
+            # 達到指定驗證樣本數即停止載入
+            if max_samples and len(self.samples) >= max_samples:
+                break
+
+        print(f"✅ 本次待處理樣本數: {len(self.samples)} 筆（已自動跳過已快取資料）。")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def collate_fn_factory(processor):
+    def collate_fn(batch):
+        ids = [b["id"] for b in batch]
+        images = [Image.open(b["image_path"]).convert("RGB") for b in batch]
+        prompts = [f"<image>{b['instruction']}" for b in batch]
+        responses = [b["response"] for b in batch]
+
+        inputs = processor(
+            images=images,
+            text=prompts,
+            suffix=responses,
+            return_tensors="pt",
+            padding=True
+        )
+        return ids, inputs
+    return collate_fn
+
+
+def run_offline_feature_distillation(
+    image_dir="data/images/train2017",
+    json_path="data/llava_instruct_150k.json",
+    output_feat_dir="data/teacher_features_10b",
+    model_id="google/paligemma2-10b-mix-448",
+    batch_size=4,
+    max_samples=25000  # 先提取 25,000 筆（約 7.5 ~ 10 小時完成全流程驗證）
+):
+    os.makedirs(output_feat_dir, exist_ok=True)
+
+    # 1. 建立資料集
+    dataset = LLaVAInstructDataset(
+        json_path=json_path,
+        image_root=image_dir,
+        output_feat_dir=output_feat_dir,
+        max_samples=max_samples
+    )
+
+    if len(dataset) == 0:
+        print("所有指定樣本皆已提取完成，或未找到有效資料！")
+        return
+
+    # 2. 自動分配雙 GPU 載入模型 (GPU 0 + GPU 1 合併 48GB)
+    print(f"正在將 10B 教師模型分配至雙 GPU: {model_id} ...")
     processor = AutoProcessor.from_pretrained(model_id)
     model = PaliGemmaForConditionalGeneration.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16
-    ).to(device)
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
     model.eval()
-    print("✅ 教師模型載入完成。")
-    return model, processor
 
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=collate_fn_factory(processor)
+    )
 
-def generate_qa_pairs(image_path, model, processor, device="cuda:0"):
-    image = Image.open(image_path).convert("RGB")
-    conversations = []
+    print(f"開始提取特徵 (目標: {len(dataset)} 筆，Batch Size = {batch_size}) ...")
+    
+    with torch.inference_mode():
+        for batch_ids, batch_inputs in tqdm(dataloader, desc="提取 10B 特徵中"):
+            # 將輸入張量傳送到模型輸入層所在的 GPU (model.device)
+            pixel_values = batch_inputs["pixel_values"].to(model.device, dtype=torch.bfloat16)
+            input_ids = batch_inputs["input_ids"].to(model.device)
+            attention_mask = batch_inputs["attention_mask"].to(model.device)
 
-    # 蒸餾任務 1: 詳細英文描述 (caption en)
-    prompt_caption = "<image>caption en"
-    inputs = processor(images=image, text=prompt_caption, return_tensors="pt").to(device)
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=64, do_sample=False)
-    # 解碼時去除 prefix prompt
-    response_caption = processor.decode(output[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-    conversations.append({
-        "instruction": "caption en",
-        "response": response_caption
-    })
+            outputs = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
 
-    # 蒸餾任務 2: 物件偵測與空間描述
-    prompt_detect = "<image>detect objects; answer question: describe the main elements and spatial relationships"
-    inputs = processor(images=image, text=prompt_detect, return_tensors="pt").to(device)
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=64, do_sample=False)
-    response_detect = processor.decode(output[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-    conversations.append({
-        "instruction": "detect objects; answer question: describe the main elements and spatial relationships",
-        "response": response_detect
-    })
+            # 取得 10B 語言模型最頂層 Hidden States (形狀: [Batch, Seq_Len, Hidden_Dim])
+            last_hidden = outputs.hidden_states[-1]
 
-    return conversations
+            # 逐筆儲存至 CPU/硬碟，釋放顯存
+            for i, sample_id in enumerate(batch_ids):
+                feat_path = os.path.join(output_feat_dir, f"{sample_id}.pt")
+                torch.save(last_hidden[i].detach().cpu(), feat_path)
 
-
-def run_offline_distillation(
-    image_dir="data/raw_images",
-    output_json="data/distilled_train.json",
-    device="cuda:0"
-):
-    os.makedirs(os.path.dirname(output_json), exist_ok=True)
-    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-    image_files = [
-        os.path.join(image_dir, f) for f in os.listdir(image_dir)
-        if os.path.splitext(f.lower())[1] in valid_exts
-    ]
-
-    if not image_files:
-        print(f"❌ 錯誤: 在 {image_dir} 找不到任何圖片！")
-        return
-
-    print(f"找到 {len(image_files)} 張圖片，開始進行 10B 知識蒸餾...")
-    model, processor = setup_teacher_model(device=device)
-
-    dataset_records = []
-    for img_path in tqdm(image_files, desc="蒸餾標註生成中"):
-        try:
-            convs = generate_qa_pairs(img_path, model, processor, device=device)
-            dataset_records.append({
-                "image_path": img_path,
-                "conversations": convs
-            })
-        except Exception as e:
-            print(f"處理圖片 {img_path} 時發生錯誤: {e}")
-
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(dataset_records, f, ensure_ascii=False, indent=2)
-
-    print(f"\n✅ 蒸餾完成！標註已儲存至: {output_json}，共 {len(dataset_records)} 筆樣本。")
+    print(f"\n🎉 驗證特徵提取完成！共儲存 {len(dataset)} 筆特徵至: {output_feat_dir}")
+    print("現在你可以直接執行 scripts/train_stage1.py 與 train_stage2.py 驗證整套訓練管線！")
 
 
 if __name__ == "__main__":
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    run_offline_distillation(device=device)
+    run_offline_feature_distillation(
+        image_dir="data/images/train2017",
+        json_path="data/llava_instruct_150k.json",
+        output_feat_dir="data/teacher_features_10b",
+        model_id="google/paligemma2-10b-mix-448",
+        batch_size=4,
+        max_samples=25000
+    )

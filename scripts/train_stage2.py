@@ -58,20 +58,21 @@ def train_stage2():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     os.makedirs("checkpoints", exist_ok=True)
 
-    # 1. 建立 10B 模型並掛載 LoRA
-    print("正在組裝 Stage 2 模型 (10B-pt-448 開啟 LoRA) ...")
+    # 1. 建立 3B-224 模型並掛載 LoRA
+    model_id = "google/paligemma2-3b-pt-224"
+    print(f"正在組裝 Stage 2 模型 ({model_id} 開啟 LoRA) ...")
     model = build_paligemma_ldpv2(
-        model_id="google/paligemma2-10b-pt-448",
+        model_id=model_id,
         use_lora=True,
         device=device
     )
 
-    # 2. 載入 Stage 1 訓練好的 LDP-v2 權重 (維度 3584)
-    stage1_ckpt = "checkpoints/ldp_v2_stage1.pth"
+    # 2. 載入 Stage 1 訓練好的 3B 規格 LDP-v2 權重 (維度 2048)
+    stage1_ckpt = "checkpoints/ldp_v2_stage1_3b_224.pth"
+    core = model.base_model.model if hasattr(model.base_model, "model") else model.base_model
     if os.path.exists(stage1_ckpt):
         print(f"正在載入 Stage 1 Projector 權重: {stage1_ckpt} ...")
-        core = model.base_model.model if hasattr(model.base_model, "model") else model.base_model
-        core.multi_modal_projector.load_state_dict(torch.load(stage1_ckpt, map_location=device))
+        core.multi_modal_projector.load_state_dict(torch.load(stage1_ckpt, map_location=device, weights_only=True))
         print("✅ Stage 1 權重載入成功！")
     else:
         print(f"⚠️ 找不到 {stage1_ckpt}，將從隨機權重直接訓練。")
@@ -79,15 +80,15 @@ def train_stage2():
     model.train()
     model.to(device)
 
-    # 3. 檢查可訓練參數量
+    # 3. 檢查可訓練參數量 (LDP-v2 + LoRA)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     trainable_num = sum(p.numel() for p in trainable_params)
     print(f"Stage 2 可訓練參數量 (LDP-v2 + LoRA): {trainable_num / 1e6:.2f} M")
 
-    # 4. 載入資料
-    processor = AutoProcessor.from_pretrained("google/paligemma2-10b-pt-448")
+    # 4. 載入 224 Processor 與資料
+    processor = AutoProcessor.from_pretrained(model_id)
     dataset = DistilledDataset("data/distilled_train.json", processor)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     print(f"成功載入資料集，共 {len(dataset)} 筆訓練樣本。")
 
     # 5. 優化器設定
@@ -119,13 +120,12 @@ def train_stage2():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     # 7. 儲存 Stage 2 產出權重
-    save_path = "checkpoints/stage2_final"
+    save_path = "checkpoints/stage2_3b_224_final"
     os.makedirs(save_path, exist_ok=True)
-    core = model.base_model.model if hasattr(model.base_model, "model") else model.base_model
     torch.save(core.multi_modal_projector.state_dict(), f"{save_path}/ldp_v2_final.pth")
     if hasattr(core.language_model, "save_pretrained"):
         core.language_model.save_pretrained(f"{save_path}/lora_adapter")
-    print(f"\n✅ Stage 2 測試完成！權重已儲存至 {save_path}/")
+    print(f"\n✅ Stage 2 (3B-224) 訓練完成！權重已儲存至 {save_path}/")
 
 
 if __name__ == "__main__":
